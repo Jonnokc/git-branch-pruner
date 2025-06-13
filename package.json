@@ -1,6 +1,6 @@
 {
-  "name": "git-branch-pruner",
-  "displayName": "Git Branch Pruner",
+  "name": "git-branch-pruner-helper",
+  "displayName": "Git Branch Pruner Helper",
   "description": "Automatically scan local branches that no longer exist on remote and allow the user to quickly prune.",
   "version": "1.0.0",
   "publisher": "jonnokc",
