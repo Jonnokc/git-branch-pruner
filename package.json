@@ -43,7 +43,7 @@
         "gitBranchPruner.autoScanInterval": {
           "type": "number",
           "default": 60,
-          "minimum": 1,
+          "minimum": 15,
           "description": "Interval in minutes to automatically scan for stale branches (0 to disable auto-scan)"
         },
         "gitBranchPruner.showNotifications": {
