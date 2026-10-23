@@ -2,7 +2,7 @@
   "name": "git-branch-pruner-helper",
   "displayName": "Git Branch Pruner Helper",
   "description": "Automatically scan local branches that no longer exist on remote and allow the user to quickly prune.",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "publisher": "jonnokc",
   "author": {
     "name": "Jonathan Adams"
@@ -30,11 +30,13 @@
     "onStartupFinished"
   ],
   "main": "./dist/extension.js",
+  "extensionKind": [
+    "workspace"
+  ],
   "contributes": {
     "configuration": {
       "title": "Git Branch Pruner",
       "properties": {
-
         "gitBranchPruner.pruneAllWorkspaceRepos": {
           "type": "boolean",
           "default": false,
@@ -43,18 +45,30 @@
         "gitBranchPruner.autoScanInterval": {
           "type": "number",
           "default": 60,
-          "minimum": 15,
-          "description": "Interval in minutes to automatically scan for stale branches (0 to disable auto-scan)"
+          "minimum": 0,
+          "description": "Interval in minutes to automatically scan for stale branches. 0 disables auto-scan; other values below 15 are treated as 15."
         },
         "gitBranchPruner.showNotifications": {
           "type": "boolean",
           "default": true,
-          "description": "Show notifications when branches are pruned"
+          "description": "Show notifications when a scan finds nothing or branches are deleted"
         },
         "gitBranchPruner.identifyOnly": {
           "type": "boolean",
           "default": false,
           "description": "Just identify what is stale without providing the option to prune"
+        },
+        "gitBranchPruner.protectedBranches": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "main",
+            "master",
+            "develop"
+          ],
+          "description": "Branch names that are never offered for deletion. The current branch and branches checked out in other worktrees are always protected."
         }
       }
     },
@@ -79,7 +93,6 @@
         "title": "Show Pruneable Branches",
         "category": "Git Branch Pruner"
       }
-
     ],
     "menus": {
       "commandPalette": [
@@ -95,7 +108,6 @@
         {
           "command": "gitBranchPruner.showPruneableStatus"
         }
-
       ]
     }
   },
@@ -111,7 +123,8 @@
     "pretest": "npm run compile-tests && npm run compile && npm run lint",
     "check-types": "tsc --noEmit",
     "lint": "eslint src",
-    "test": "node ./out/test/runTest.js"
+    "test": "vscode-test",
+    "test:unit": "npm run compile-tests && mocha --ui tdd \"out/test/node/**/*.test.js\""
   },
   "devDependencies": {
     "@types/mocha": "^10.0.10",
@@ -119,6 +132,7 @@
     "@types/vscode": "^1.74.0",
     "@typescript-eslint/eslint-plugin": "^5.45.0",
     "@typescript-eslint/parser": "^5.45.0",
+    "@vscode/test-cli": "^0.0.15",
     "@vscode/test-electron": "^2.2.0",
     "esbuild": "^0.19.2",
     "eslint": "^8.28.0",
@@ -126,8 +140,5 @@
     "mocha": "^10.1.0",
     "npm-run-all": "^4.1.5",
     "typescript": "^4.9.4"
-  },
-  "dependencies": {
-    "simple-git": "^3.19.1"
   }
 }
