@@ -64,8 +64,43 @@ export function isStale(branch: BranchInfo, protectedBranches: readonly string[]
 }
 
 /**
+ * A stale branch that git won't delete yet because a worktree whose folder was
+ * deleted still has it checked out. `git worktree prune` releases it.
+ */
+export function isHeldByPrunableWorktree(
+    branch: BranchInfo,
+    protectedBranches: readonly string[],
+    prunableWorktrees: ReadonlySet<string>
+): boolean {
+    return prunableWorktrees.has(branch.worktreePath)
+        && isStale({ ...branch, worktreePath: '' }, protectedBranches);
+}
+
+export interface BranchClassification {
+    /** Safe to delete now */
+    stale: BranchInfo[];
+    /** Would be stale, but held by a worktree whose folder is gone */
+    held: BranchInfo[];
+}
+
+/**
+ * Parse for-each-ref output and sort out the branches worth offering.
+ */
+export function classifyBranches(
+    output: string,
+    protectedBranches: readonly string[],
+    prunableWorktrees: ReadonlySet<string> = new Set()
+): BranchClassification {
+    const branches = parseBranches(output);
+    return {
+        stale: branches.filter(branch => isStale(branch, protectedBranches)),
+        held: branches.filter(branch => isHeldByPrunableWorktree(branch, protectedBranches, prunableWorktrees))
+    };
+}
+
+/**
  * Parse for-each-ref output and return only the stale branches.
  */
 export function findStaleBranches(output: string, protectedBranches: readonly string[]): BranchInfo[] {
-    return parseBranches(output).filter(branch => isStale(branch, protectedBranches));
+    return classifyBranches(output, protectedBranches).stale;
 }

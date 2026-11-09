@@ -1,5 +1,5 @@
 import * as assert from 'assert';
-import { BranchInfo, isStale, parseBranches } from '../../staleBranches';
+import { BranchInfo, isHeldByPrunableWorktree, isStale, parseBranches } from '../../staleBranches';
 
 const protectedBranches = ['main', 'master', 'develop'];
 
@@ -57,5 +57,26 @@ suite('isStale', () => {
     test('checked-out branches are never stale', () => {
         assert.strictEqual(isStale(branch({ isHead: true, worktreePath: '/repo' }), protectedBranches), false);
         assert.strictEqual(isStale(branch({ worktreePath: '/repo-wt' }), protectedBranches), false);
+    });
+});
+
+suite('isHeldByPrunableWorktree', () => {
+    const prunable = new Set(['/deleted-wt']);
+
+    test('gone branch checked out only in a deleted worktree is held', () => {
+        assert.strictEqual(isHeldByPrunableWorktree(branch({ worktreePath: '/deleted-wt' }), protectedBranches, prunable), true);
+    });
+
+    test('branch in a worktree that still exists is not held', () => {
+        assert.strictEqual(isHeldByPrunableWorktree(branch({ worktreePath: '/live-wt' }), protectedBranches, prunable), false);
+    });
+
+    test('branch not checked out anywhere is stale, not held', () => {
+        assert.strictEqual(isHeldByPrunableWorktree(branch({}), protectedBranches, prunable), false);
+    });
+
+    test('live or protected branches in a deleted worktree are not held', () => {
+        assert.strictEqual(isHeldByPrunableWorktree(branch({ worktreePath: '/deleted-wt', track: '' }), protectedBranches, prunable), false);
+        assert.strictEqual(isHeldByPrunableWorktree(branch({ name: 'main', worktreePath: '/deleted-wt' }), protectedBranches, prunable), false);
     });
 });

@@ -2,7 +2,8 @@ import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs';
 import { execGit, withTimeout } from './git';
-import { BranchInfo, forEachRefArgs, findStaleBranches } from './staleBranches';
+import { BranchInfo, classifyBranches, forEachRefArgs } from './staleBranches';
+import { findRepositories, prunableWorktreePaths, Repository, worktreeListArgs } from './worktrees';
 import type { API as GitAPI, GitExtension } from './types/git';
 
 /**
@@ -25,9 +26,13 @@ interface RunOptions {
 
 interface ScanResult {
     branches: StaleBranch[];
+    /** Stale branches git won't delete until the deleted worktrees holding them are pruned */
+    held: StaleBranch[];
     fetchFailures: string[];
     scanFailures: string[];
 }
+
+const cleanUpWorktreesLabel = 'Clean Up Worktrees';
 
 const minAutoScanMinutes = 15;
 const firstAutoScanDelayMs = 30 * 1000;
@@ -43,6 +48,15 @@ function plural(count: number, word: string, suffix = 'es'): string {
 }
 
 /**
+ * "app (3), api (1)": how many of the branches are in each repository
+ */
+function countByRepository(branches: StaleBranch[]): string {
+    const counts = new Map<string, number>();
+    branches.forEach(b => counts.set(b.repositoryName, (counts.get(b.repositoryName) ?? 0) + 1));
+    return [...counts].map(([name, count]) => `${name} (${count})`).join(', ');
+}
+
+/**
  * Main extension class that handles git branch pruning functionality
  */
 export class GitBranchPruner implements vscode.Disposable {
@@ -53,7 +67,7 @@ export class GitBranchPruner implements vscode.Disposable {
     private notificationSnoozeUntil: number = 0;
     private busy = false;
     private warnedAboutFetch = false;
-    private lastScan: { at: number, branches: StaleBranch[] } | undefined;
+    private lastScan: { at: number, branches: StaleBranch[], held: StaleBranch[] } | undefined;
     private gitApi: GitAPI | undefined;
 
     constructor(context: vscode.ExtensionContext) {
@@ -190,22 +204,34 @@ export class GitBranchPruner implements vscode.Disposable {
     }
 
     /**
+     * Collapse candidate paths into distinct repositories. VS Code opens each
+     * worktree as its own repository, but they all share one set of branches.
+     */
+    private async locateRepositories(candidates: string[]): Promise<Repository[]> {
+        const { repositories, missing } = await findRepositories(this.gitPath, candidates);
+        missing.forEach(p => this.log(`Skipped ${p}: the folder no longer exists`));
+        repositories
+            .filter(repo => repo.worktrees.length > 1)
+            .forEach(repo => this.log(`${repo.name}: ${repo.worktrees.length} open worktrees share one repository, scanning it once from ${repo.path}`));
+        return repositories;
+    }
+
+    /**
      * All git repositories in the workspace: those the Git extension has open, plus
      * the repository containing each workspace folder
      */
-    private async getWorkspaceGitRepositories(): Promise<string[]> {
+    private async getWorkspaceGitRepositories(): Promise<Repository[]> {
         const api = await this.getGitApi();
-        const found = new Map<string, string>();
+        const candidates: string[] = [];
         const add = (repoPath: string | null) => {
             if (repoPath) {
-                const key = process.platform === 'win32' ? repoPath.toLowerCase() : repoPath;
-                found.set(key, repoPath);
+                candidates.push(repoPath);
             }
         };
 
         api?.repositories.forEach(repository => add(repository.rootUri.fsPath));
         vscode.workspace.workspaceFolders?.forEach(folder => add(this.repositoryFor(folder.uri)));
-        return [...found.values()];
+        return this.locateRepositories(candidates);
     }
 
     /**
@@ -225,12 +251,12 @@ export class GitBranchPruner implements vscode.Disposable {
         return folder ? this.repositoryFor(folder.uri) : null;
     }
 
-    private async getRepositories(scope: Scope): Promise<string[]> {
+    private async getRepositories(scope: Scope): Promise<Repository[]> {
         if (scope === 'all') {
             return this.getWorkspaceGitRepositories();
         }
         const repo = await this.getActiveRepository();
-        return repo ? [repo] : [];
+        return repo ? this.locateRepositories([repo]) : [];
     }
 
     // ---------------------------------------------------------------- scanning
@@ -252,20 +278,33 @@ export class GitBranchPruner implements vscode.Disposable {
      * Fetch and classify branches in each repository. A failed fetch doesn't stop
      * detection; it just means the results reflect the last successful fetch.
      */
+    /**
+     * Worktrees whose folders were deleted without `git worktree remove`. An empty
+     * set if git can't say, which only means held branches stay unreported.
+     */
+    private async getPrunableWorktrees(repository: Repository): Promise<Set<string>> {
+        try {
+            return prunableWorktreePaths(await execGit(this.gitPath, repository.path, worktreeListArgs));
+        } catch (error) {
+            this.log(`Could not list worktrees in ${repository.name}: ${errorMessage(error)}`);
+            return new Set();
+        }
+    }
+
     private async scan(
-        repositories: string[],
+        repositories: Repository[],
         progress?: vscode.Progress<{ message?: string, increment?: number }>,
         token?: vscode.CancellationToken
     ): Promise<ScanResult | undefined> {
         const protectedBranches = this.config.get<string[]>('protectedBranches', defaultProtectedBranches);
-        const result: ScanResult = { branches: [], fetchFailures: [], scanFailures: [] };
+        const result: ScanResult = { branches: [], held: [], fetchFailures: [], scanFailures: [] };
         this.updateStatusBar('Scanning...');
 
-        for (const [index, repositoryPath] of repositories.entries()) {
+        for (const [index, repository] of repositories.entries()) {
             if (token?.isCancellationRequested) {
                 return undefined;
             }
-            const repositoryName = path.basename(repositoryPath);
+            const { path: repositoryPath, name: repositoryName } = repository;
             progress?.report({
                 message: `Checking ${repositoryName} (${index + 1}/${repositories.length})...`,
                 increment: 100 / repositories.length
@@ -280,16 +319,20 @@ export class GitBranchPruner implements vscode.Disposable {
 
             try {
                 const output = await execGit(this.gitPath, repositoryPath, forEachRefArgs);
-                const stale = findStaleBranches(output, protectedBranches);
+                const { stale, held } = classifyBranches(output, protectedBranches, await this.getPrunableWorktrees(repository));
                 this.log(`${repositoryName}: ${plural(stale.length, 'stale branch')}${stale.length ? ` (${stale.map(b => b.name).join(', ')})` : ''}`);
+                if (held.length) {
+                    this.log(`${repositoryName}: ${plural(held.length, 'stale branch')} held by deleted worktrees (${held.map(b => `${b.name} at ${b.worktreePath}`).join(', ')})`);
+                }
                 result.branches.push(...stale.map(branch => ({ ...branch, repositoryPath, repositoryName })));
+                result.held.push(...held.map(branch => ({ ...branch, repositoryPath, repositoryName })));
             } catch (error) {
                 this.log(`Could not read branches in ${repositoryName}: ${errorMessage(error)}`);
                 result.scanFailures.push(repositoryName);
             }
         }
 
-        this.lastScan = { at: Date.now(), branches: result.branches };
+        this.lastScan = { at: Date.now(), branches: result.branches, held: result.held };
         return result;
     }
 
@@ -304,7 +347,11 @@ export class GitBranchPruner implements vscode.Disposable {
         if (problems.length === 0) {
             return;
         }
-        const choice = await vscode.window.showWarningMessage(`Git Branch Pruner: ${problems.join(' ')}`, 'Show Output');
+        await this.warnWithOutput(`Git Branch Pruner: ${problems.join(' ')}`);
+    }
+
+    private async warnWithOutput(message: string): Promise<void> {
+        const choice = await vscode.window.showWarningMessage(message, 'Show Output');
         if (choice === 'Show Output') {
             this.outputChannel.show();
         }
@@ -326,7 +373,7 @@ export class GitBranchPruner implements vscode.Disposable {
         }
 
         const repositories = await this.getRepositories(scope);
-        this.log(`Manual ${identifyOnly ? 'identify' : 'prune'} (${scope}): ${repositories.join(', ') || 'no repositories'}`);
+        this.log(`Manual ${identifyOnly ? 'identify' : 'prune'} (${scope}): ${repositories.map(r => r.path).join(', ') || 'no repositories'}`);
         if (repositories.length === 0) {
             if (showNotifications) {
                 vscode.window.showInformationMessage('No git repositories found');
@@ -344,13 +391,87 @@ export class GitBranchPruner implements vscode.Disposable {
         }
 
         void this.reportScanProblems(result);
+        // Not awaited: an unanswered toast can sit in the notification centre indefinitely.
+        // Clicking it later reopens the checklist with the freed branches added.
+        if (result.held.length) {
+            void this.reportHeldBranches(result.held, identifyOnly);
+        }
         if (result.branches.length === 0) {
-            if (showNotifications) {
+            if (showNotifications && result.held.length === 0) {
                 vscode.window.showInformationMessage('No stale branches found');
             }
             return;
         }
         await this.reviewBranches(result.branches, identifyOnly);
+    }
+
+    /**
+     * Tell the user about stale branches that a deleted worktree still holds, and
+     * offer to release them. Nothing is pruned unless they click.
+     */
+    private async reportHeldBranches(held: StaleBranch[], identifyOnly: boolean): Promise<void> {
+        const names = held.length > 3
+            ? `${held.slice(0, 3).map(b => b.name).join(', ')} and ${held.length - 3} more`
+            : held.map(b => b.name).join(', ');
+        const message = `${plural(held.length, 'stale branch')} (${names}) can't be deleted yet: `
+            + `${held.length === 1 ? 'it is' : 'they are'} still checked out in worktrees whose folders were deleted.`;
+
+        if (identifyOnly) {
+            vscode.window.showInformationMessage(`${message} Run "git worktree prune" to release them.`);
+            return;
+        }
+        const choice = await vscode.window.showWarningMessage(message, cleanUpWorktreesLabel);
+        if (choice === cleanUpWorktreesLabel) {
+            await this.cleanUpWorktrees();
+        }
+    }
+
+    /**
+     * Run `git worktree prune` in each repository that has held branches. That only
+     * removes git's records of worktrees whose folders are already gone; no files or
+     * branches are touched. Then open the checklist with the freed branches included.
+     */
+    private async cleanUpWorktrees(): Promise<void> {
+        // Use the freshest results in case another scan ran while the toast was up
+        const held = this.lastScan?.held ?? [];
+        if (held.length === 0) {
+            vscode.window.showInformationMessage('No branches are held by deleted worktrees');
+            return;
+        }
+        if (this.busy) {
+            vscode.window.showInformationMessage('Git Branch Pruner is busy scanning. Try again in a moment.');
+            return;
+        }
+
+        const repositories = new Map(held.map(b => [b.repositoryPath, b.repositoryName]));
+        const pruned = new Set<string>();
+        await this.exclusive(async () => {
+            this.updateStatusBar('Cleaning up worktrees...');
+            for (const [repositoryPath, repositoryName] of repositories) {
+                try {
+                    await execGit(this.gitPath, repositoryPath, ['worktree', 'prune']);
+                    this.log(`Pruned records of deleted worktrees in ${repositoryName}`);
+                    pruned.add(repositoryPath);
+                } catch (error) {
+                    this.log(`git worktree prune failed in ${repositoryName}: ${errorMessage(error)}`);
+                }
+            }
+        });
+
+        const freed = held.filter(b => pruned.has(b.repositoryPath));
+        if (this.lastScan) {
+            this.lastScan.held = this.lastScan.held.filter(b => !freed.includes(b));
+            this.lastScan.branches = [...this.lastScan.branches, ...freed];
+            this.updateStatusBar();
+        }
+        if (freed.length < held.length) {
+            const failed = [...repositories].filter(([p]) => !pruned.has(p)).map(([, name]) => name);
+            void this.warnWithOutput(`Couldn't clean up worktrees in ${failed.join(', ')}.`);
+        }
+        // Only reopen the checklist when the cleanup freed something to add to it
+        if (freed.length) {
+            await this.reviewBranches(this.lastScan?.branches ?? freed, false);
+        }
     }
 
     /**
@@ -422,13 +543,7 @@ export class GitBranchPruner implements vscode.Disposable {
         }
 
         if (failed.length) {
-            const choice = await vscode.window.showWarningMessage(
-                `Deleted ${plural(deleted.length, 'branch')}. Couldn't delete ${failed.map(b => b.name).join(', ')}.`,
-                'Show Output'
-            );
-            if (choice === 'Show Output') {
-                this.outputChannel.show();
-            }
+            await this.warnWithOutput(`Deleted ${plural(deleted.length, 'branch')}. Couldn't delete ${failed.map(b => b.name).join(', ')}.`);
         } else if (this.config.get<boolean>('showNotifications', true)) {
             vscode.window.showInformationMessage(`Deleted ${plural(deleted.length, 'stale branch')}`);
         }
@@ -478,7 +593,7 @@ export class GitBranchPruner implements vscode.Disposable {
             if (repositories.length === 0) {
                 return;
             }
-            this.log(`Auto-scan: ${repositories.join(', ')}`);
+            this.log(`Auto-scan: ${repositories.map(r => r.path).join(', ')}`);
             const result = await this.exclusive(() => this.scan(repositories));
             if (!result) {
                 this.log('Auto-scan skipped: another scan is running');
@@ -489,8 +604,8 @@ export class GitBranchPruner implements vscode.Disposable {
                 this.warnedAboutFetch = true;
                 void this.reportScanProblems(result);
             }
-            if (result.branches.length > 0) {
-                await this.showStaleFoundNotification(result.branches);
+            if (result.branches.length > 0 || result.held.length > 0) {
+                await this.showStaleFoundNotification(result);
             }
         } catch (error) {
             this.log(`Auto-scan failed: ${errorMessage(error)}`);
@@ -501,17 +616,27 @@ export class GitBranchPruner implements vscode.Disposable {
      * Notify about branches found by auto-scan. "Prune Now" opens the picker with
      * these results directly instead of scanning and confirming all over again.
      */
-    private async showStaleFoundNotification(branches: StaleBranch[]): Promise<void> {
-        const counts = new Map<string, number>();
-        branches.forEach(b => counts.set(b.repositoryName, (counts.get(b.repositoryName) ?? 0) + 1));
-        const repoList = [...counts].map(([name, count]) => `${name} (${count})`).join(', ');
-        const message = `Found ${plural(branches.length, 'stale local branch')} in: ${repoList}`;
+    private async showStaleFoundNotification({ branches, held }: ScanResult): Promise<void> {
+        const parts: string[] = [];
+        if (branches.length) {
+            parts.push(`Found ${plural(branches.length, 'stale local branch')} in: ${countByRepository(branches)}.`);
+        }
+        if (held.length) {
+            parts.push(`${plural(held.length, 'stale branch')} held by deleted worktrees in: ${countByRepository(held)}.`);
+        }
 
         const identifyOnly = this.config.get<boolean>('identifyOnly', false);
         const reviewLabel = identifyOnly ? 'Show' : 'Prune Now';
-        const choice = await vscode.window.showInformationMessage(message, reviewLabel, 'Snooze');
+        const actions = [
+            ...(branches.length ? [reviewLabel] : []),
+            ...(held.length && !identifyOnly ? [cleanUpWorktreesLabel] : []),
+            'Snooze'
+        ];
+        const choice = await vscode.window.showInformationMessage(parts.join(' '), ...actions);
 
-        if (choice === reviewLabel) {
+        if (choice === cleanUpWorktreesLabel) {
+            await this.cleanUpWorktrees();
+        } else if (choice === reviewLabel) {
             // Use the freshest results in case a manual run or delete happened while the toast was up
             const latest = this.lastScan?.branches ?? branches;
             if (latest.length === 0) {

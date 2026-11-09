@@ -7,6 +7,7 @@ Finds local branches whose remote branch has been deleted and lets you delete th
 - A branch counts as stale only when git's own upstream tracking reports its remote branch as `[gone]`. Branches you never pushed are left alone.
 - You review every deletion in one checklist: untick the branches you want to keep and press Enter.
 - `main`, `master`, `develop`, your current branch and branches checked out in other worktrees are never offered for deletion.
+- Worktrees are understood: a repository is scanned once however many of its worktrees VS Code has open, and branches stuck in a deleted worktree are reported with an offer to free them.
 - It works in a WSL window. The extension runs inside WSL next to your repository and fetches with the same credentials as VS Code's Source Control view.
 - A background scan can run on a timer and notify you when it finds stale branches.
 - You can scan every repository in the workspace or only the one you're working in.
@@ -89,6 +90,12 @@ Each scan runs `git fetch --all --prune`, then treats a branch as stale when all
 Branches are deleted with `git branch -D`, because branches merged by squash or rebase look unmerged to git. Each deletion is logged in the "Git Branch Pruner" output panel.
 
 If the fetch fails, for example because there's no network or no credentials, the scan still runs against the last successful fetch and shows a warning. A branch deleted on the remote since then won't appear until a fetch succeeds.
+
+### Worktrees
+
+All worktrees of a repository share one set of branches, so the extension groups them by their shared `.git` directory and scans each repository once, running git from the main worktree when it's open.
+
+When a worktree's folder is deleted without `git worktree remove` (some tools that create worktrees do this), git keeps a record of it and treats its branch as still checked out, so `git branch -D` refuses to delete it. The extension reports these branches and offers "Clean Up Worktrees". That runs `git worktree prune`, which removes the records of worktree folders that no longer exist and nothing else, then opens the checklist with the freed branches included. Nothing is pruned unless you click it. In identify-only mode the branches are reported without the button.
 
 ## Configuration examples
 

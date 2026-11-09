@@ -2,6 +2,12 @@
 
 All notable changes to the "git-branch-pruner" extension will be documented in this file.
 
+## [1.2.0]
+
+- Each repository is scanned once, however many of its worktrees are open. VS Code opens every worktree as its own repository, so a repository with 11 worktrees used to be fetched 11 times and list each stale branch 11 times. Results now carry the main repository's name, not a worktree folder's.
+- Worktrees whose folders were deleted are skipped instead of showing up as scan errors.
+- Stale branches still checked out in a deleted worktree are reported. Git won't delete them until its record of that worktree is removed. "Clean Up Worktrees" runs `git worktree prune`, which removes only the records of folders that are already gone, then opens the checklist with those branches included.
+
 ## [1.1.0]
 
 - Works in a WSL window. The extension runs where the repository is and fetches through VS Code's Git extension, so credentials work.
